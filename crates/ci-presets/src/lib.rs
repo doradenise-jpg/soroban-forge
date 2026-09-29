@@ -27,6 +27,30 @@ pub const DEFAULT_MSRV: &str = "1.84";
 pub const DEFAULT_MAX_SIZE: u64 = 65_536;
 const DEPENDABOT_CONFIG: &str = "dependabot.yml";
 
+/// Validate that `version` is a well-formed Rust version string of the form
+/// `major.minor` or `major.minor.patch`, where each component is a non-negative
+/// integer.  Strings like `"latest"`, `"stable"`, `"1"`, or `"1.84.0.1"` are
+/// rejected with a descriptive [`ForgeError::InvalidArgument`].
+pub fn validate_msrv(version: &str) -> Result<()> {
+    let parts: Vec<&str> = version.split('.').collect();
+    let valid = match parts.as_slice() {
+        [major, minor] => major.parse::<u64>().is_ok() && minor.parse::<u64>().is_ok(),
+        [major, minor, patch] => {
+            major.parse::<u64>().is_ok()
+                && minor.parse::<u64>().is_ok()
+                && patch.parse::<u64>().is_ok()
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ForgeError::InvalidArgument(format!(
+            "invalid --msrv value `{version}`: expected major.minor or major.minor.patch (e.g. `1.84` or `1.84.0`)"
+        )))
+    }
+}
+
 pub fn available_providers() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = PRESETS
         .dirs()
@@ -367,6 +391,11 @@ impl ForgePlugin for CiPresetsPlugin {
             dependabot: matches.get_flag("dependabot"),
             max_size: Some(max_size),
         };
+
+        // Validate --msrv before touching the filesystem.
+        if let Some(msrv) = &opts.msrv {
+            validate_msrv(msrv)?;
+        }
 
         if matches.get_flag("diff") {
             let provider_dir = PRESETS.get_dir(provider).ok_or_else(|| {
@@ -781,5 +810,85 @@ mod tests {
             .map(|path| std::path::PathBuf::from(path))
             .unwrap();
         assert_eq!(dir, std::path::PathBuf::from("../contracts/demo"));
+    }
+
+    // --msrv validation -------------------------------------------------------
+
+    #[test]
+    fn msrv_valid_major_minor() {
+        assert!(validate_msrv("1.84").is_ok());
+        assert!(validate_msrv("1.0").is_ok());
+        assert!(validate_msrv("0.1").is_ok());
+        assert!(validate_msrv("2.0").is_ok());
+    }
+
+    #[test]
+    fn msrv_valid_major_minor_patch() {
+        assert!(validate_msrv("1.84.0").is_ok());
+        assert!(validate_msrv("1.0.0").is_ok());
+        assert!(validate_msrv("1.75.1").is_ok());
+    }
+
+    #[test]
+    fn msrv_invalid_channel_names() {
+        let err = validate_msrv("stable").unwrap_err().to_string();
+        assert!(err.contains("invalid --msrv value"), "{err}");
+        let err = validate_msrv("latest").unwrap_err().to_string();
+        assert!(err.contains("invalid --msrv value"), "{err}");
+        let err = validate_msrv("nightly").unwrap_err().to_string();
+        assert!(err.contains("invalid --msrv value"), "{err}");
+    }
+
+    #[test]
+    fn msrv_invalid_too_few_components() {
+        let err = validate_msrv("1").unwrap_err().to_string();
+        assert!(err.contains("invalid --msrv value"), "{err}");
+    }
+
+    #[test]
+    fn msrv_invalid_too_many_components() {
+        let err = validate_msrv("1.84.0.1").unwrap_err().to_string();
+        assert!(err.contains("invalid --msrv value"), "{err}");
+    }
+
+    #[test]
+    fn msrv_invalid_non_numeric_component() {
+        let err = validate_msrv("1.84-beta").unwrap_err().to_string();
+        assert!(err.contains("invalid --msrv value"), "{err}");
+        let err = validate_msrv("a.b").unwrap_err().to_string();
+        assert!(err.contains("invalid --msrv value"), "{err}");
+    }
+
+    /// An invalid --msrv must fail before any file is written.
+    ///
+    /// The guard in `run()` calls `validate_msrv` before invoking `generate()`.
+    /// We test the contract by confirming:
+    ///   1. `validate_msrv` itself returns `Err` for a bad value.
+    ///   2. Wrapping the same pattern (validate then generate) produces no files
+    ///      on disk when validation fails.
+    #[test]
+    fn msrv_invalid_fails_before_files_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate the guard in run(): validate first, only call generate() on Ok.
+        let msrv = "latest";
+        let result = validate_msrv(msrv).and_then(|_| {
+            generate(
+                dir.path(),
+                "github",
+                "my-contract",
+                false,
+                false,
+                &GenerateOptions {
+                    msrv: Some(msrv.to_string()),
+                    ..Default::default()
+                },
+                false,
+            )
+        });
+        assert!(result.is_err(), "must fail for invalid msrv");
+        assert!(
+            !dir.path().join(".github").exists(),
+            ".github must not be created when msrv validation fails"
+        );
     }
 }

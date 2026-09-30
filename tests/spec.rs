@@ -267,3 +267,48 @@ fn spec_with_timeout_flag_accepted() {
     );
     assert!(stderr.contains("stellar contract build"), "{stderr}");
 }
+
+// #403 — spec --out: help must mention --out and --force
+#[test]
+fn spec_help_mentions_out_and_force_flags() {
+    let output = forge().args(["spec", "--help"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--out"), "help must mention --out: {stdout}");
+    assert!(stdout.contains("--force"), "help must mention --force: {stdout}");
+}
+
+// #403 — spec --out: without --force, must refuse to overwrite an existing file
+#[test]
+fn spec_out_refuses_to_overwrite_existing_file_without_force() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = scaffold(temp.path(), "spec-out-no-force");
+    let out_file = temp.path().join("spec.txt");
+
+    // Pre-create the output file
+    std::fs::write(&out_file, "existing content").unwrap();
+
+    let output = forge()
+        .args([
+            "spec",
+            "--path",
+            project.to_str().unwrap(),
+            "--out",
+            out_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    // Should report AlreadyExists (exit code 1)
+    assert!(
+        stderr.contains("already exists") || output.status.code() == Some(1),
+        "expected already-exists error: {stderr}"
+    );
+    // Original file must be untouched
+    assert_eq!(
+        std::fs::read_to_string(&out_file).unwrap(),
+        "existing content"
+    );
+}

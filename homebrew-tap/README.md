@@ -49,24 +49,42 @@ Supported platforms:
 | Linux             | `arm64`       | `soroban-forge-<version>-aarch64-unknown-linux-gnu.tar.gz` |
 | Linux             | `x86_64`      | `soroban-forge-<version>-x86_64-unknown-linux-gnu.tar.gz`  |
 
+Each archive contains a single `soroban-forge` binary at its root, so `install`
+is just `bin.install`. On top of that the formula generates shell completions
+for bash, zsh, and fish, and installs man pages when the binary provides them
+-- users do not need to wire either up by hand.
+
 ## Releasing a new version
 
-1. Build and upload the four release archives to the GitHub Releases page for
-   the new tag (e.g. `v0.2.0`).  The CI release workflow in the main
-   repository does this automatically.
-2. Compute each archive's SHA-256:
-   ```sh
-   shasum -a 256 soroban-forge-*.tar.gz
-   ```
-3. Update `version`, `url`, and `sha256` in
-   [`Formula/soroban-forge.rb`](Formula/soroban-forge.rb).
-4. Open a pull request against `soroban-forge-labs/homebrew-tap`.
+Releases are automated. Pushing a `v*` tag to the main repository runs its
+[`release` workflow](https://github.com/soroban-forge-labs/soroban-forge/blob/main/.github/workflows/release.yml),
+which:
 
-Alternatively, use `brew bump-formula-pr` to automate steps 2–4:
+1. Checks the tag against `[workspace.package].version` in `Cargo.toml` and
+   stops if they disagree.
+2. Cross-builds `soroban-forge` for every supported target and packages each
+   binary as a flat archive.
+3. Publishes the archives plus a `SHA256SUMS.txt` manifest to GitHub Releases.
+4. Regenerates this formula with the real checksums and, when the
+   `HOMEBREW_TAP_TOKEN` secret is configured, commits it to this repository.
 
 ```sh
-brew bump-formula-pr \
-  --url https://github.com/soroban-forge-labs/soroban-forge/releases/download/v<NEW_VERSION>/soroban-forge-<NEW_VERSION>-<TARGET>.tar.gz \
-  --sha256 <SHA256> \
-  soroban-forge-labs/tap/soroban-forge
+# from the main repository
+./scripts/release.sh 0.2.0
 ```
+
+### Updating the formula by hand
+
+`Formula/soroban-forge.rb` is generated -- do not edit it directly. The
+generator lives in the main repository and is the single source of truth, so
+the checked-in formula and the release tooling cannot drift apart:
+
+```sh
+# in a clone of soroban-forge-labs/soroban-forge
+curl -fsSLO https://github.com/soroban-forge-labs/soroban-forge/releases/download/v0.2.0/SHA256SUMS.txt
+./scripts/update-homebrew-formula.sh --version 0.2.0 --checksums SHA256SUMS.txt
+```
+
+Then copy `homebrew-tap/Formula/soroban-forge.rb` into this repository at
+`Formula/soroban-forge.rb`. Every published release also attaches the rendered
+formula as a `soroban-forge.rb` asset, which you can drop in as-is.

@@ -41,6 +41,42 @@ pub fn available_providers() -> Vec<&'static str> {
     names
 }
 
+/// Parse and validate a comma-separated provider string such as `"github,gitlab"`.
+///
+/// Returns a `Vec` of de-duplicated, trimmed provider names, or an
+/// [`ForgeError::InvalidArgument`] listing every unrecognised name.
+pub fn parse_providers(raw: &str) -> Result<Vec<String>> {
+    let known = available_providers();
+    let mut providers: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+
+    for token in raw.split(',') {
+        let name = token.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if !known.contains(&name.as_str()) {
+            unknown.push(name);
+        } else if !providers.contains(&name) {
+            providers.push(name);
+        }
+    }
+
+    if !unknown.is_empty() {
+        return Err(ForgeError::InvalidArgument(format!(
+            "unknown provider(s) `{}` (available: {})",
+            unknown.join(", "),
+            known.join(", ")
+        )));
+    }
+    if providers.is_empty() {
+        return Err(ForgeError::InvalidArgument(
+            "at least one provider must be specified".into(),
+        ));
+    }
+    Ok(providers)
+}
+
 pub fn output_dir(provider: &str) -> &'static str {
     match provider {
         "github" => ".github/workflows",
@@ -419,7 +455,7 @@ impl ForgePlugin for CiPresetsPlugin {
                 Arg::new("provider")
                     .long("provider")
                     .default_value("github")
-                    .help("CI provider (`github`, `gitlab`, `circleci`, `azure`, `bitbucket`, `woodpecker`, or `buildkite`)"),
+                    .help("CI provider(s) — one of `github`, `gitlab`, `circleci`, `azure`, `bitbucket`, `woodpecker`, `buildkite`, or a comma-separated list (e.g. `github,gitlab`)"),
             )
             .arg(Arg::new("deploy").long("deploy").action(ArgAction::SetTrue))
             .arg(Arg::new("security-scan").long("security-scan").action(ArgAction::SetTrue))
@@ -444,7 +480,9 @@ impl ForgePlugin for CiPresetsPlugin {
     }
 
     fn run(&self, matches: &ArgMatches, ctx: &ForgeContext) -> Result<()> {
-        let provider = matches.get_one::<String>("provider").expect("has default");
+        let raw_provider = matches.get_one::<String>("provider").expect("has default");
+        let providers = parse_providers(raw_provider)?;
+
         let dir = matches
             .get_one::<String>("path")
             .map(|p| ctx.cwd.join(p))
@@ -474,120 +512,137 @@ impl ForgePlugin for CiPresetsPlugin {
             max_size: Some(max_size),
         };
 
+        // ── --remove ───────────────────────────────────────────────────────
         if matches.get_flag("remove") {
-            let removed = remove(&dir, provider, matches.get_flag("force"))?;
+            let force = matches.get_flag("force");
             if ctx.json {
-                let report = serde_json::json!({
-                    "provider": provider,
-                    "removed_files": removed,
-                });
+                let mut results = Vec::new();
+                for provider in &providers {
+                    let removed = remove(&dir, provider, force)?;
+                    results.push(serde_json::json!({
+                        "provider": provider,
+                        "removed_files": removed,
+                    }));
+                }
+                let report = if results.len() == 1 {
+                    results.remove(0)
+                } else {
+                    serde_json::json!(results)
+                };
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            } else if !ctx.quiet {
-                if removed.is_empty() {
-                    println!("no forge-generated {provider} files found");
-                } else {
-                    println!("removed {provider} CI files:");
-                    for path in &removed {
-                        println!("  {path}");
+            } else {
+                for provider in &providers {
+                    let removed = remove(&dir, provider, force)?;
+                    if !ctx.quiet {
+                        if removed.is_empty() {
+                            println!("no forge-generated {provider} files found");
+                        } else {
+                            println!("removed {provider} CI files:");
+                            for path in &removed {
+                                println!("  {path}");
+                            }
+                        }
                     }
                 }
             }
             return Ok(());
         }
 
+        // ── --diff ─────────────────────────────────────────────────────────
         if matches.get_flag("diff") {
-            let provider_dir = PRESETS.get_dir(provider).ok_or_else(|| {
-                ForgeError::InvalidArgument(format!(
-                    "unknown provider `{provider}` (available: {})",
-                    available_providers().join(", ")
-                ))
-            })?;
-            let mut selected: Vec<(&str, Option<&str>)> = match provider.as_str() {
-                "github" => {
-                    let mut list: Vec<(&str, Option<&str>)> = BASE_WORKFLOWS.iter().map(|n| (*n, None)).collect();
-                    if opts.deploy { list.push((DEPLOY_WORKFLOW, None)); }
-                    if opts.security_scan { list.push((SECURITY_SCAN_WORKFLOW, None)); list.push((DENY_TOML, Some("."))); }
-                    if opts.coverage { list.push((COVERAGE_WORKFLOW, None)); }
-                    if opts.actionlint { list.push((ACTIONLINT_WORKFLOW, None)); }
-                    if opts.healthcheck { list.push((HEALTHCHECK_WORKFLOW, None)); }
-                    if matches.get_flag("release") { list.push((RELEASE_WORKFLOW, None)); }
-                    if opts.matrix { list.push((MATRIX_WORKFLOW, None)); }
-                    if opts.dependabot { list.push((DEPENDABOT_CONFIG, Some(".github"))); }
-                    list
-                }
-                "gitlab" => vec![(".gitlab-ci.yml", None)],
-                "bitbucket" => vec![("bitbucket-pipelines.yml", None)],
-                "azure" => vec![("azure-pipelines.yml", None)],
-                "circleci" => vec![("config.yml", None)],
-                "woodpecker" => vec![(".woodpecker.yml", None)],
-                "buildkite" => vec![("pipeline.yml", None)],
-                _ => return Err(ForgeError::InvalidArgument(format!(
-                    "unknown provider `{provider}` (available: {})",
-                    available_providers().join(", ")
-                ))),
-            };
-
-            for (preset_name, dest_rel_override) in selected.drain(..) {
-                let file = provider_dir
-                    .get_file(format!("{provider}/{preset_name}"))
-                    .ok_or_else(|| ForgeError::Template(format!("missing preset file {provider}/{preset_name}")))?;
-                let contents = file
-                    .contents_utf8()
-                    .ok_or_else(|| ForgeError::Template(format!("preset {preset_name} is not UTF-8")))?;
-                let dest_rel = dest_rel_override.unwrap_or(output_dir(provider));
-                let out_path = dir.join(dest_rel).join(preset_name);
-                let rendered = render_str(contents, &{
-                    let mut vars = Vars::new();
-                    vars.insert("project_name".into(), name.to_string());
-                    vars.insert("crate_name".into(), name.replace('-', "_"));
-                    vars.insert("msrv".into(), opts.msrv.clone().unwrap_or_else(|| DEFAULT_MSRV.to_string()));
-                    vars.insert("max_size".into(), max_size.to_string());
-                    vars
-                });
-                if out_path.exists() {
-                    let existing = std::fs::read_to_string(&out_path)
-                        .map_err(ForgeError::io(format!("reading {}", out_path.display())))?;
-                    if existing == rendered {
-                        continue;
+            for provider in &providers {
+                let provider_dir = PRESETS.get_dir(provider.as_str()).ok_or_else(|| {
+                    ForgeError::InvalidArgument(format!(
+                        "unknown provider `{provider}` (available: {})",
+                        available_providers().join(", ")
+                    ))
+                })?;
+                let mut selected: Vec<(&str, Option<&str>)> = match provider.as_str() {
+                    "github" => {
+                        let mut list: Vec<(&str, Option<&str>)> = BASE_WORKFLOWS.iter().map(|n| (*n, None)).collect();
+                        if opts.deploy { list.push((DEPLOY_WORKFLOW, None)); }
+                        if opts.security_scan { list.push((SECURITY_SCAN_WORKFLOW, None)); list.push((DENY_TOML, Some("."))); }
+                        if opts.coverage { list.push((COVERAGE_WORKFLOW, None)); }
+                        if opts.actionlint { list.push((ACTIONLINT_WORKFLOW, None)); }
+                        if opts.healthcheck { list.push((HEALTHCHECK_WORKFLOW, None)); }
+                        if matches.get_flag("release") { list.push((RELEASE_WORKFLOW, None)); }
+                        if opts.matrix { list.push((MATRIX_WORKFLOW, None)); }
+                        if opts.dependabot { list.push((DEPENDABOT_CONFIG, Some(".github"))); }
+                        list
                     }
-                    print_diff(&out_path, &rendered)?;
-                } else {
-                    let parent = out_path.parent().unwrap_or(&dir);
-                    std::fs::create_dir_all(parent).map_err(ForgeError::io(format!("creating {}", parent.display())))?;
-                    print_diff(&out_path, &rendered)?;
+                    "gitlab" => vec![(".gitlab-ci.yml", None)],
+                    "bitbucket" => vec![("bitbucket-pipelines.yml", None)],
+                    "azure" => vec![("azure-pipelines.yml", None)],
+                    "circleci" => vec![("config.yml", None)],
+                    "woodpecker" => vec![(".woodpecker.yml", None)],
+                    "buildkite" => vec![("pipeline.yml", None)],
+                    _ => return Err(ForgeError::InvalidArgument(format!(
+                        "unknown provider `{provider}` (available: {})",
+                        available_providers().join(", ")
+                    ))),
+                };
+
+                for (preset_name, dest_rel_override) in selected.drain(..) {
+                    let file = provider_dir
+                        .get_file(format!("{provider}/{preset_name}"))
+                        .ok_or_else(|| ForgeError::Template(format!("missing preset file {provider}/{preset_name}")))?;
+                    let contents = file
+                        .contents_utf8()
+                        .ok_or_else(|| ForgeError::Template(format!("preset {preset_name} is not UTF-8")))?;
+                    let dest_rel = dest_rel_override.unwrap_or(output_dir(provider));
+                    let out_path = dir.join(dest_rel).join(preset_name);
+                    let rendered = render_str(contents, &{
+                        let mut vars = Vars::new();
+                        vars.insert("project_name".into(), name.to_string());
+                        vars.insert("crate_name".into(), name.replace('-', "_"));
+                        vars.insert("msrv".into(), opts.msrv.clone().unwrap_or_else(|| DEFAULT_MSRV.to_string()));
+                        vars.insert("max_size".into(), max_size.to_string());
+                        vars
+                    });
+                    if out_path.exists() {
+                        let existing = std::fs::read_to_string(&out_path)
+                            .map_err(ForgeError::io(format!("reading {}", out_path.display())))?;
+                        if existing == rendered {
+                            continue;
+                        }
+                        print_diff(&out_path, &rendered)?;
+                    } else {
+                        let parent = out_path.parent().unwrap_or(&dir);
+                        std::fs::create_dir_all(parent).map_err(ForgeError::io(format!("creating {}", parent.display())))?;
+                        print_diff(&out_path, &rendered)?;
+                    }
                 }
             }
             return Ok(());
         }
 
-        let written = generate(
-            &dir,
-            provider,
-            &name,
-            opts.deploy,
-            matches.get_flag("release"),
-            &opts,
-            matches.get_flag("force"),
-        )?;
+        // ── generate ───────────────────────────────────────────────────────
+        let release = matches.get_flag("release");
+        let force = matches.get_flag("force");
 
         if ctx.json {
-            let report = serde_json::json!({
-                "provider": provider,
-                "project_name": name,
-                "written_files": written,
-            });
+            let mut results = Vec::new();
+            for provider in &providers {
+                let written = generate(&dir, provider, &name, opts.deploy, release, &opts, force)?;
+                results.push(serde_json::json!({
+                    "provider": provider,
+                    "project_name": name,
+                    "written_files": written,
+                }));
+            }
+            let report = if results.len() == 1 {
+                results.remove(0)
+            } else {
+                serde_json::json!(results)
+            };
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        } else if !ctx.quiet {
-            print!(
-                "{}",
-                format_report(
-                    provider,
-                    &name,
-                    &written,
-                    matches.get_flag("release"),
-                    &opts
-                )
-            );
+        } else {
+            for provider in &providers {
+                let written = generate(&dir, provider, &name, opts.deploy, release, &opts, force)?;
+                if !ctx.quiet {
+                    print!("{}", format_report(provider, &name, &written, release, &opts));
+                }
+            }
         }
         Ok(())
     }
@@ -908,6 +963,107 @@ mod tests {
             .map(|path| std::path::PathBuf::from(path))
             .unwrap();
         assert_eq!(dir, std::path::PathBuf::from("../contracts/demo"));
+    }
+
+    // ── parse_providers tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_providers_single() {
+        assert_eq!(parse_providers("github").unwrap(), vec!["github"]);
+    }
+
+    #[test]
+    fn parse_providers_two_providers() {
+        assert_eq!(
+            parse_providers("github,gitlab").unwrap(),
+            vec!["github", "gitlab"]
+        );
+    }
+
+    #[test]
+    fn parse_providers_ignores_whitespace() {
+        assert_eq!(
+            parse_providers(" github , gitlab ").unwrap(),
+            vec!["github", "gitlab"]
+        );
+    }
+
+    #[test]
+    fn parse_providers_deduplicates() {
+        assert_eq!(
+            parse_providers("github,github").unwrap(),
+            vec!["github"]
+        );
+    }
+
+    #[test]
+    fn parse_providers_rejects_unknown() {
+        let err = parse_providers("github,jenkins").unwrap_err().to_string();
+        assert!(err.contains("jenkins"), "error should name the bad provider: {err}");
+    }
+
+    #[test]
+    fn parse_providers_rejects_empty_string() {
+        assert!(parse_providers("").is_err());
+        assert!(parse_providers(",,,").is_err());
+    }
+
+    /// Two providers in a single invocation each produce their own files and
+    /// neither tramples the other's output directory.
+    #[test]
+    fn generate_two_providers_in_one_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // github
+        let github_written = generate(
+            dir.path(),
+            "github",
+            "my-contract",
+            false,
+            false,
+            &base_opts(),
+            false,
+        )
+        .unwrap();
+        // gitlab
+        let gitlab_written = generate(
+            dir.path(),
+            "gitlab",
+            "my-contract",
+            false,
+            false,
+            &base_opts(),
+            false,
+        )
+        .unwrap();
+
+        // Each provider wrote at least one file.
+        assert!(!github_written.is_empty(), "github should write files");
+        assert!(!gitlab_written.is_empty(), "gitlab should write files");
+
+        // The two sets of files are entirely disjoint.
+        for gh in &github_written {
+            assert!(
+                !gitlab_written.contains(gh),
+                "file {gh} appears in both provider outputs"
+            );
+        }
+
+        // The files actually exist on disk.
+        for path in github_written.iter().chain(gitlab_written.iter()) {
+            assert!(
+                dir.path().join(path).exists(),
+                "{path} should exist on disk"
+            );
+        }
+
+        // GitHub writes into .github/workflows/; GitLab writes at the root.
+        assert!(github_written
+            .iter()
+            .all(|p| p.starts_with(".github/workflows/")));
+        assert!(gitlab_written
+            .iter()
+            .all(|p| p == ".gitlab-ci.yml"));
     }
 
     // ── --remove tests ─────────────────────────────────────────────────────

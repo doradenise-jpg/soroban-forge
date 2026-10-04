@@ -1156,4 +1156,37 @@ mod tests {
             .unwrap();
         assert!(matches.get_flag("remove"));
     }
+
+    /// `--remove` only removes forge's own generated preset files, never arbitrary
+    /// user files in the same directory.
+    #[test]
+    fn remove_preserves_unrelated_user_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = GenerateOptions::default();
+        let written = generate(dir.path(), "github", "demo", false, false, &opts, false).unwrap();
+        assert!(!written.is_empty());
+
+        let wf_dir = dir.path().join(".github/workflows");
+        let custom_file = wf_dir.join("my-custom-pipeline.yml");
+        std::fs::write(&custom_file, "name: custom\non: push\njobs: {}\n").unwrap();
+
+        let removed = remove(dir.path(), "github", true).unwrap();
+        assert_eq!(removed.len(), written.len());
+        assert!(!wf_dir.join("build-test.yml").exists());
+        assert!(custom_file.exists(), "custom user file must not be removed");
+    }
+
+    /// `--remove` removes previously generated files for other providers (e.g. gitlab).
+    #[test]
+    fn remove_deletes_gitlab_preset_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = GenerateOptions::default();
+        let written = generate(dir.path(), "gitlab", "demo", false, false, &opts, false).unwrap();
+        assert_eq!(written, vec![".gitlab-ci.yml".to_string()]);
+        assert!(dir.path().join(".gitlab-ci.yml").exists());
+
+        let removed = remove(dir.path(), "gitlab", false).unwrap();
+        assert_eq!(removed, vec![".gitlab-ci.yml".to_string()]);
+        assert!(!dir.path().join(".gitlab-ci.yml").exists());
+    }
 }

@@ -126,6 +126,22 @@ pub struct GenerateOptions {
     pub max_size: Option<u64>,
 }
 
+/// Validate that `msrv` follows a `major.minor` (optionally `.patch`) pattern,
+/// e.g. `1.84` or `1.84.0`.
+pub fn validate_msrv(msrv: &str) -> Result<()> {
+    let parts: Vec<&str> = msrv.split('.').collect();
+    let is_valid = match parts.len() {
+        2 | 3 => parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+        _ => false,
+    };
+    if !is_valid {
+        return Err(ForgeError::InvalidArgument(format!(
+            "invalid --msrv value `{msrv}`: expected Rust version in `major.minor` or `major.minor.patch` format (e.g. `1.84` or `1.84.0`)"
+        )));
+    }
+    Ok(())
+}
+
 pub fn generate(
     dir: &Path,
     provider: &str,
@@ -135,6 +151,10 @@ pub fn generate(
     opts: &GenerateOptions,
     force: bool,
 ) -> Result<Vec<String>> {
+    if let Some(ref msrv) = opts.msrv {
+        validate_msrv(msrv)?;
+    }
+
     let provider_dir = PRESETS.get_dir(provider).ok_or_else(|| {
         ForgeError::InvalidArgument(format!(
             "unknown provider `{provider}` (available: {})",
@@ -464,7 +484,12 @@ impl ForgePlugin for CiPresetsPlugin {
             .arg(Arg::new("healthcheck").long("healthcheck").action(ArgAction::SetTrue))
             .arg(Arg::new("matrix").long("matrix").action(ArgAction::SetTrue))
             .arg(Arg::new("stale").long("stale").action(ArgAction::SetTrue))
-            .arg(Arg::new("msrv").long("msrv").value_name("VERSION"))
+            .arg(
+                Arg::new("msrv")
+                    .long("msrv")
+                    .value_name("VERSION")
+                    .help("Minimum supported Rust version (e.g. 1.84 or 1.84.0)"),
+            )
             .arg(Arg::new("max-size").long("max-size").value_name("BYTES").value_parser(clap::value_parser!(u64)))
             .arg(Arg::new("dependabot").long("dependabot").action(ArgAction::SetTrue))
             .arg(Arg::new("release").long("release").action(ArgAction::SetTrue))
@@ -511,6 +536,10 @@ impl ForgePlugin for CiPresetsPlugin {
             dependabot: matches.get_flag("dependabot"),
             max_size: Some(max_size),
         };
+
+        if let Some(ref msrv) = opts.msrv {
+            validate_msrv(msrv)?;
+        }
 
         // ── --remove ───────────────────────────────────────────────────────
         if matches.get_flag("remove") {
@@ -1156,4 +1185,63 @@ mod tests {
             .unwrap();
         assert!(matches.get_flag("remove"));
     }
+
+    // ── --msrv validation tests ─────────────────────────────────────────────
+
+    #[test]
+    fn msrv_validation_accepts_valid_versions() {
+        assert!(validate_msrv("1.84").is_ok());
+        assert!(validate_msrv("1.84.0").is_ok());
+        assert!(validate_msrv("1.80").is_ok());
+        assert!(validate_msrv("2.0.1").is_ok());
+    }
+
+    #[test]
+    fn msrv_validation_rejects_invalid_versions() {
+        assert!(validate_msrv("latest").is_err());
+        assert!(validate_msrv("1.84.0.1").is_err());
+        assert!(validate_msrv("1").is_err());
+        assert!(validate_msrv("v1.84").is_err());
+        assert!(validate_msrv("1.84-nightly").is_err());
+        assert!(validate_msrv("").is_err());
+        assert!(validate_msrv("1.").is_err());
+        assert!(validate_msrv(".84").is_err());
+    }
+
+    #[test]
+    fn generate_fails_before_writing_files_on_invalid_msrv() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = GenerateOptions {
+            msrv: Some("latest".to_string()),
+            ..Default::default()
+        };
+        let err = generate(dir.path(), "github", "demo", false, false, &opts, false).unwrap_err();
+        match err {
+            ForgeError::InvalidArgument(msg) => {
+                assert!(msg.contains("invalid --msrv value `latest`"));
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(entries.is_empty(), "no files should be written when msrv is invalid");
+    }
+
+    #[test]
+    fn run_fails_on_invalid_msrv() {
+        let plugin = CiPresetsPlugin;
+        let cmd = plugin.command();
+        let matches = cmd
+            .try_get_matches_from(["ci-init", "--provider", "github", "--msrv", "1.84.0.1"])
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ForgeContext::new(dir.path().to_path_buf(), 0).unwrap();
+        let err = plugin.run(&matches, &ctx).unwrap_err();
+        match err {
+            ForgeError::InvalidArgument(msg) => {
+                assert!(msg.contains("invalid --msrv value `1.84.0.1`"));
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
 }
+

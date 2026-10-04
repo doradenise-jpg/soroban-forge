@@ -1066,6 +1066,32 @@ mod tests {
             .all(|p| p == ".gitlab-ci.yml"));
     }
 
+    /// Shared flags (--deploy, --matrix, etc.) apply uniformly across all requested providers.
+    #[test]
+    fn generate_multi_provider_applies_shared_flags_uniformly() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = CiPresetsPlugin;
+        let cmd = plugin.command();
+        let matches = cmd
+            .try_get_matches_from([
+                "ci-init",
+                "--provider",
+                "github,gitlab",
+                "--deploy",
+                "--matrix",
+            ])
+            .unwrap();
+        let ctx = ForgeContext::new(dir.path().to_path_buf(), 0).unwrap();
+        plugin.run(&matches, &ctx).unwrap();
+
+        // Both github and gitlab files must exist on disk.
+        let wf_dir = dir.path().join(".github/workflows");
+        assert!(wf_dir.join("build-test.yml").exists());
+        assert!(wf_dir.join("testnet-deploy.yml").exists(), "deploy flag should apply to github");
+        assert!(wf_dir.join("build-test-matrix.yml").exists(), "matrix flag should apply to github");
+        assert!(dir.path().join(".gitlab-ci.yml").exists(), "gitlab preset should be generated");
+    }
+
     // ── --remove tests ─────────────────────────────────────────────────────
 
     /// `--remove` deletes every file that the preset generated.

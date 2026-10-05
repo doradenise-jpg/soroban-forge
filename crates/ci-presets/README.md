@@ -34,6 +34,17 @@ reminder without changing the generated workflows. `--actionlint` adds a
 workflow that runs `actionlint` over `.github/workflows`, and `--diff` prints
 a unified diff for each generated preset without writing changes.
 
+## Targeting multiple providers
+
+`--provider` accepts a comma-separated list of providers:
+
+```bash
+soroban-forge ci-init --provider github,gitlab --deploy --matrix
+```
+
+Shared flags (`--deploy`, `--matrix`, `--coverage`, etc.) apply uniformly across
+all requested providers in a single invocation.
+
 ## Security stance
 
 The deploy workflow **never stores keys**. It references

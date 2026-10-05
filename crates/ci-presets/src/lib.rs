@@ -126,6 +126,22 @@ pub struct GenerateOptions {
     pub max_size: Option<u64>,
 }
 
+/// Validate that `msrv` follows a `major.minor` (optionally `.patch`) pattern,
+/// e.g. `1.84` or `1.84.0`.
+pub fn validate_msrv(msrv: &str) -> Result<()> {
+    let parts: Vec<&str> = msrv.split('.').collect();
+    let is_valid = match parts.len() {
+        2 | 3 => parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+        _ => false,
+    };
+    if !is_valid {
+        return Err(ForgeError::InvalidArgument(format!(
+            "invalid --msrv value `{msrv}`: expected Rust version in `major.minor` or `major.minor.patch` format (e.g. `1.84` or `1.84.0`)"
+        )));
+    }
+    Ok(())
+}
+
 pub fn generate(
     dir: &Path,
     provider: &str,
@@ -135,6 +151,10 @@ pub fn generate(
     opts: &GenerateOptions,
     force: bool,
 ) -> Result<Vec<String>> {
+    if let Some(ref msrv) = opts.msrv {
+        validate_msrv(msrv)?;
+    }
+
     let provider_dir = PRESETS.get_dir(provider).ok_or_else(|| {
         ForgeError::InvalidArgument(format!(
             "unknown provider `{provider}` (available: {})",
@@ -464,7 +484,12 @@ impl ForgePlugin for CiPresetsPlugin {
             .arg(Arg::new("healthcheck").long("healthcheck").action(ArgAction::SetTrue))
             .arg(Arg::new("matrix").long("matrix").action(ArgAction::SetTrue))
             .arg(Arg::new("stale").long("stale").action(ArgAction::SetTrue))
-            .arg(Arg::new("msrv").long("msrv").value_name("VERSION"))
+            .arg(
+                Arg::new("msrv")
+                    .long("msrv")
+                    .value_name("VERSION")
+                    .help("Minimum supported Rust version (e.g. 1.84 or 1.84.0)"),
+            )
             .arg(Arg::new("max-size").long("max-size").value_name("BYTES").value_parser(clap::value_parser!(u64)))
             .arg(Arg::new("dependabot").long("dependabot").action(ArgAction::SetTrue))
             .arg(Arg::new("release").long("release").action(ArgAction::SetTrue))
@@ -511,6 +536,10 @@ impl ForgePlugin for CiPresetsPlugin {
             dependabot: matches.get_flag("dependabot"),
             max_size: Some(max_size),
         };
+
+        if let Some(ref msrv) = opts.msrv {
+            validate_msrv(msrv)?;
+        }
 
         // ── --remove ───────────────────────────────────────────────────────
         if matches.get_flag("remove") {
@@ -1066,6 +1095,32 @@ mod tests {
             .all(|p| p == ".gitlab-ci.yml"));
     }
 
+    /// Shared flags (--deploy, --matrix, etc.) apply uniformly across all requested providers.
+    #[test]
+    fn generate_multi_provider_applies_shared_flags_uniformly() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = CiPresetsPlugin;
+        let cmd = plugin.command();
+        let matches = cmd
+            .try_get_matches_from([
+                "ci-init",
+                "--provider",
+                "github,gitlab",
+                "--deploy",
+                "--matrix",
+            ])
+            .unwrap();
+        let ctx = ForgeContext::new(dir.path().to_path_buf(), 0).unwrap();
+        plugin.run(&matches, &ctx).unwrap();
+
+        // Both github and gitlab files must exist on disk.
+        let wf_dir = dir.path().join(".github/workflows");
+        assert!(wf_dir.join("build-test.yml").exists());
+        assert!(wf_dir.join("testnet-deploy.yml").exists(), "deploy flag should apply to github");
+        assert!(wf_dir.join("build-test-matrix.yml").exists(), "matrix flag should apply to github");
+        assert!(dir.path().join(".gitlab-ci.yml").exists(), "gitlab preset should be generated");
+    }
+
     // ── --remove tests ─────────────────────────────────────────────────────
 
     /// `--remove` deletes every file that the preset generated.
@@ -1190,3 +1245,4 @@ mod tests {
         assert!(!dir.path().join(".gitlab-ci.yml").exists());
     }
 }
+
